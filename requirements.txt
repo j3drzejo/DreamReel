@@ -1,0 +1,16 @@
+# Python 3.10 - 3.12 required (Kokoro does not support 3.13 yet).
+# Install PyTorch FIRST for your hardware (see README.md), then:
+#   pip install -r requirements.txt
+
+torch
+transformers>=4.51
+diffusers>=0.36
+accelerate>=0.34
+huggingface_hub
+safetensors
+kokoro>=0.9.4
+soundfile
+pillow>=10.1
+numpy
+scipy
+imageio-ffmpeg   # bundled ffmpeg fallback if the system ffmpeg is missing
