@@ -35,10 +35,29 @@ class LLM:
         self.model_id = model_id
         log(f"Loading LLM {model_id} ...")
         self.tok = AutoTokenizer.from_pretrained(model_id)
-        try:
-            self.model = AutoModelForCausalLM.from_pretrained(model_id, device_map="auto", dtype="auto")
-        except (TypeError, ValueError):  # older transformers only know torch_dtype
-            self.model = AutoModelForCausalLM.from_pretrained(model_id, device_map="auto", torch_dtype="auto")
+        device = config.get_device()
+        # Put the WHOLE model on the accelerator. device_map="auto" may offload layers to disk on Macs, which is
+        # many times slower. Fall back to "auto" only if the model really does not fit.
+        maps = [{"": device}, "auto"] if device in ("cuda", "mps") else ["auto"]
+        last = None
+        for dm in maps:
+            for kw in ("dtype", "torch_dtype"):
+                try:
+                    self.model = AutoModelForCausalLM.from_pretrained(model_id, device_map=dm, **{kw: "auto"})
+                    break
+                except TypeError:
+                    continue
+                except Exception as exc:
+                    last = exc
+                    free_memory()
+                    log(f"  loading with device_map={dm!r} failed ({type(exc).__name__}); trying the next option")
+                    break
+            else:
+                continue
+            if hasattr(self, "model"):
+                break
+        if not hasattr(self, "model"):
+            raise last or RuntimeError("could not load the LLM")
         self.model.eval()
 
     def chat(self, system: str, user: str, max_new_tokens: int, temperature: float = 0.7) -> str:
@@ -305,10 +324,21 @@ def _narrate_chapter(llm: LLM, outline: dict, i: int, words: int, prev_tail: str
             break
         more = clean_narration(llm.chat(SYSTEM_NARRATOR, _extend_prompt(outline, i, text, words - _word_count(text)),
                                         max_new_tokens=int(words * 1.4) + 100, temperature=0.7))
+        more = _cap_words(more, int((words - _word_count(text)) * 1.25) + 10)
         text = (text + "\n\n" + more).strip()
     if not text:
         text = f"{outline['chapters'][i]['summary']}. Take a slow breath, and let the scene settle around you."
     return text
+
+
+def _cap_words(text: str, max_words: int) -> str:
+    """Trim to at most max_words, ending on a sentence boundary."""
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    cut = " ".join(words[:max_words])
+    end = max(cut.rfind(". "), cut.rfind("? "), cut.rfind("! "), cut.rfind('." '))
+    return cut[: end + 1] if end > len(cut) * 0.5 else cut
 
 
 def _tail(text: str, n: int = 45) -> str:
@@ -345,6 +375,7 @@ def _write_narration(llm: LLM, cfg: config.Settings, outline: dict, cache) -> di
             need = max(60, per - _word_count(texts[k]) + 40)
             more = clean_narration(llm.chat(SYSTEM_NARRATOR, _extend_prompt(outline, k, texts[k], need),
                                             max_new_tokens=int(need * 1.6) + 100))
+            more = _cap_words(more, int(need * 1.25))
             if more:
                 texts[k] = texts[k] + "\n\n" + more
                 (parts / f"ch{k + 1:02d}.txt").write_text(texts[k], encoding="utf-8")

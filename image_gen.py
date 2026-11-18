@@ -25,7 +25,7 @@ SHOT_VARIANTS = [
 MODEL_SPECS: Dict[str, dict] = {
     "Tongyi-MAI/Z-Image-Turbo": dict(w=1280, h=720, steps=9, guidance=0.0, dtype="bf16", offload=True),
     "black-forest-labs/FLUX.2-klein-4B": dict(w=1280, h=720, steps=4, guidance=1.0, dtype="bf16", offload=True),
-    "stabilityai/sdxl-turbo": dict(w=1024, h=576, steps=4, guidance=0.0, dtype="fp16", offload=False),
+    "stabilityai/sdxl-turbo": dict(w=1024, h=576, steps=4, guidance=0.0, dtype="fp16", offload=False, clip=True),
 }
 DEFAULT_SPEC = dict(w=1280, h=720, steps=8, guidance=0.0, dtype="bf16", offload=True)
 
@@ -45,7 +45,10 @@ def build_image_plan(timeline: Dict, seconds_per_image: float = SECONDS_PER_IMAG
     return plan
 
 
-def _prompt_for(ch: Dict, j: int) -> str:
+STYLE_SHORT = "oil painting, muted warm palette, soft candlelight, distant figures"
+
+
+def _prompt_for(ch: Dict, j: int, clip: bool = False) -> str:
     subs = ch.get("sub_scenes") or []
     if j == 0:
         scene = ch["image_prompt"]
@@ -53,6 +56,9 @@ def _prompt_for(ch: Dict, j: int) -> str:
         scene = subs[j - 1]
     else:
         scene = f"{ch['image_prompt']}, {SHOT_VARIANTS[j % len(SHOT_VARIANTS)]}"
+    if clip:  # CLIP text encoders read only 77 tokens: keep the scene first and the style short
+        scene = " ".join(scene.replace("\n", " ").split()[:30]).rstrip(",.;: ")
+        return f"{scene}. {STYLE_SHORT}"
     return f"{scene}. {STYLE}"
 
 
@@ -80,7 +86,10 @@ def _load_pipe(model_id: str, spec: dict, device: str):
 
     dtype = torch.float32 if device == "cpu" else (torch.bfloat16 if spec["dtype"] == "bf16" else torch.float16)
     log(f"Loading image model {model_id} ({str(dtype).split('.')[-1]}) ...")
-    pipe = DiffusionPipeline.from_pretrained(model_id, torch_dtype=dtype)
+    try:
+        pipe = DiffusionPipeline.from_pretrained(model_id, dtype=dtype)
+    except TypeError:
+        pipe = DiffusionPipeline.from_pretrained(model_id, torch_dtype=dtype)
     if device == "cuda":
         pipe.enable_model_cpu_offload() if spec["offload"] else pipe.to("cuda")
     elif device == "mps":
@@ -137,7 +146,7 @@ def _generate_one(pipe, spec: dict, prompt: str, seed: int) -> Image.Image:
 def generate_images(cfg: config.Settings, script: Dict, timeline: Dict, cache: Path) -> List[Dict]:
     img_dir = cache / "images"
     img_dir.mkdir(parents=True, exist_ok=True)
-    plan = build_image_plan(timeline)
+    plan = build_image_plan(timeline, cfg.image_interval)
     for seg in plan:
         seg["path"] = str(img_dir / seg["file"])
     todo = [s for s in plan if not Path(s["path"]).exists()]
@@ -168,7 +177,7 @@ def generate_images(cfg: config.Settings, script: Dict, timeline: Dict, cache: P
                 ch = script["chapters"][seg["chapter"]]
                 seed = cfg.seed + seg["chapter"] * 100 + seg["sub"]
                 log(f"Image {n}/{len(todo)}  (chapter {seg['chapter'] + 1}, scene {seg['sub'] + 1})")
-                img = _to_1080p(_generate_one(pipe, spec, _prompt_for(ch, seg["sub"]), seed))
+                img = _to_1080p(_generate_one(pipe, spec, _prompt_for(ch, seg["sub"], spec.get("clip", False)), seed))
                 tmp = Path(seg["path"] + ".tmp.png")
                 img.save(tmp, "PNG")
                 tmp.replace(seg["path"])

@@ -20,6 +20,13 @@ from typing import Any, Optional
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")  # let unsupported MPS ops fall back to CPU
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("DIFFUSERS_VERBOSITY", "error")
+
+import warnings  # noqa: E402
+
+for _cat in (FutureWarning, UserWarning, DeprecationWarning):
+    warnings.filterwarnings("ignore", category=_cat)
 
 # --------------------------------------------------------------------------- video
 VIDEO_W, VIDEO_H, FPS = 1920, 1080, 24
@@ -29,7 +36,9 @@ AUDIO_BITRATE = "192k"
 AUDIO_SR = 44100
 CROSSFADE_SECONDS = 1.0
 VIGNETTE_STRENGTH = 0.55
-SECONDS_PER_IMAGE = 25.0          # one new image roughly every 20-30 s of narration
+SECONDS_PER_IMAGE = 24.0          # one new AI image about every 24 s (generation is the slow part)
+SHOT_MIN_SECONDS = 4.0            # each image is cut into shots of 4-8 s with different framing/camera moves
+SHOT_MAX_SECONDS = 8.0
 END_FADE_SECONDS = 4.0            # fade to black at the very end
 MIN_TOTAL_SECONDS = 605.0         # hard guarantee: output is always 10+ minutes
 
@@ -77,6 +86,7 @@ class Settings:
     keep_cache: bool = False
     fresh: bool = False
     fire_db: float = FIRE_IDLE_DB
+    image_interval: float = SECONDS_PER_IMAGE
 
     @property
     def target_words(self) -> int:
@@ -101,7 +111,8 @@ def read_json(path: Path) -> Any:
 
 
 def sanitize_folder_name(name: str, max_len: int = 110) -> str:
-    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", name)
+    name = name.replace("|", "-")
+    name = re.sub(r'[<>:"/\\?*\x00-\x1f]', "", name)
     name = re.sub(r"\s+", " ", name).strip().strip(".")
     if len(name) > max_len:
         name = name[:max_len].rsplit(" ", 1)[0].strip()

@@ -1,8 +1,9 @@
-"""1080p / 24 fps / H.264 / AAC rendering with Ken Burns motion, crossfades, vignette and no on-screen text.
+"""1080p / 24 fps / H.264 / AAC rendering: dynamic multi-shot Ken Burns, crossfades, vignette. No on-screen text.
 
+Every AI image is split into several 4-8 second "shots", each with its own framing (wide, close detail, pan,
+tilt, push-in, pull-out) so the picture changes every few seconds without needing 150+ generated images.
 Every frame is computed with Pillow using *fractional* crop boxes (sub-pixel accurate bicubic resize),
-so the slow zooms and pans are perfectly smooth - no integer-rounding jitter like FFmpeg's zoompan.
-Frames are streamed straight into ffmpeg's stdin; no temporary frame files are written.
+so zooms and pans are perfectly smooth. Frames are streamed straight into ffmpeg's stdin.
 """
 from __future__ import annotations
 
@@ -16,14 +17,14 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
-from PIL import Image, ImageChops, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont
 
 import config
-from config import (AUDIO_BITRATE, CROSSFADE_SECONDS, END_FADE_SECONDS, FPS, VIDEO_H, VIDEO_W,
-                    VIGNETTE_STRENGTH, X264_CRF, X264_PRESET, log)
+from config import (AUDIO_BITRATE, CROSSFADE_SECONDS, END_FADE_SECONDS, FPS, SHOT_MAX_SECONDS, SHOT_MIN_SECONDS,
+                    VIDEO_H, VIDEO_W, VIGNETTE_STRENGTH, X264_CRF, X264_PRESET, log)
 from image_gen import build_image_plan  # noqa: F401  (re-exported for callers)
 
 W, H = VIDEO_W, VIDEO_H
@@ -63,59 +64,102 @@ def _font(size: int) -> ImageFont.FreeTypeFont:
         return ImageFont.load_default()
 
 
-# --------------------------------------------------------------------------- motion
-def _motion(idx: int, seed: int) -> dict:
-    rng = random.Random(seed * 7919 + idx)
-    mode = ["zoom_in", "pan_right", "zoom_out", "pan_left", "zoom_in_drift", "pan_right_zoom"][(idx + rng.randrange(0, 2)) % 6]
-    zmax = 1.0 + rng.uniform(0.09, 0.14)
-    jitter = lambda: rng.uniform(-0.04, 0.04)
-    if mode == "zoom_in":
-        return dict(z0=1.0, z1=zmax, c0=(0.5, 0.5), c1=(0.5 + jitter(), 0.5 + jitter()))
-    if mode == "zoom_out":
-        return dict(z0=zmax, z1=1.0, c0=(0.5 + jitter(), 0.5 + jitter()), c1=(0.5, 0.5))
-    if mode == "zoom_in_drift":
-        return dict(z0=1.0, z1=zmax, c0=(0.5, 0.5), c1=(0.5 + rng.choice([-1, 1]) * 0.12, 0.5 + jitter()))
-    z = 1.12
-    if mode == "pan_right":
-        return dict(z0=z, z1=z, c0=(0.0, 0.5 + jitter()), c1=(1.0, 0.5 + jitter()))
-    if mode == "pan_left":
-        return dict(z0=z, z1=z, c0=(1.0, 0.5 + jitter()), c1=(0.0, 0.5 + jitter()))
-    return dict(z0=1.05, z1=1.13, c0=(0.0, 0.5), c1=(1.0, 0.5))  # pan_right_zoom
+# --------------------------------------------------------------------------- shots
+def expand_shots(plan: List[Dict], seed: int = 0) -> List[Dict]:
+    """Split every image segment into consecutive shots of roughly 4-8 s (never one static image for long)."""
+    rng = random.Random(seed * 31 + 7)
+    mid = (SHOT_MIN_SECONDS + SHOT_MAX_SECONDS) / 2
+    out: List[Dict] = []
+    for seg in plan:
+        d = seg["end"] - seg["start"]
+        n = max(1, int(round(d / mid)))
+        while n > 1 and d / n < SHOT_MIN_SECONDS:
+            n -= 1
+        while d / n > SHOT_MAX_SECONDS:
+            n += 1
+        cuts = [seg["start"]] + [seg["start"] + d * k / n + rng.uniform(-0.1, 0.1) * d / n for k in range(1, n)] + [seg["end"]]
+        for k in range(n):
+            out.append({**seg, "start": cuts[k], "end": cuts[k + 1], "shot": k, "nshots": n})
+    return out
+
+
+FOCI = [(0.5, 0.5), (0.30, 0.50), (0.70, 0.50), (0.50, 0.32), (0.50, 0.68),
+        (0.28, 0.34), (0.72, 0.66), (0.72, 0.34), (0.28, 0.66)]
+MODES = ["zoom_in", "pan", "zoom_out", "tilt", "diag_zoom", "pan", "zoom_in", "tilt"]
+
+
+def _motion(mode: str, f: tuple, rng: random.Random) -> dict:
+    zs = rng.uniform(0.20, 0.32)
+    sign = rng.choice([-1, 1])
+    if mode == "zoom_in":                     # push in on a point of interest
+        z0 = rng.uniform(1.0, 1.10)
+        return dict(z0=z0, z1=z0 + zs, c0=(0.5, 0.5), c1=f)
+    if mode == "zoom_out":                    # pull back from a detail to the wide view
+        z1 = rng.uniform(1.0, 1.10)
+        return dict(z0=z1 + zs, z1=z1, c0=f, c1=(0.5, 0.5))
+    if mode == "pan":                         # full-width horizontal slide with a slight push
+        z = rng.uniform(1.32, 1.42)
+        return dict(z0=z, z1=z + 0.05, c0=(0.5 - sign * 0.5, f[1]), c1=(0.5 + sign * 0.5, f[1] + rng.uniform(-0.05, 0.05)))
+    if mode == "tilt":                        # vertical slide
+        z = rng.uniform(1.32, 1.42)
+        return dict(z0=z, z1=z, c0=(f[0], 0.5 - sign * 0.5), c1=(f[0] + rng.uniform(-0.05, 0.05), 0.5 + sign * 0.5))
+    z0 = rng.uniform(1.05, 1.15)              # diag_zoom: diagonal push-in
+    return dict(z0=z0, z1=z0 + zs, c0=(1 - f[0], 1 - f[1]), c1=f)
 
 
 class Renderer:
     def __init__(self, plan: List[Dict], timeline: Dict, script: Dict, seed: int = 0):
-        self.plan, self.total = plan, timeline["total_duration"]
-        self.starts = [s["start"] for s in plan]
-        self.n = len(plan)
-        self.motion = [_motion(i, seed) for i in range(self.n)]
+        self.plan = expand_shots(plan, seed)
+        self.total = timeline["total_duration"]
+        self.starts = [s["start"] for s in self.plan]
+        self.n = len(self.plan)
+        self.motion: List[dict] = []
+        per_image: Dict[str, tuple] = {}
+        prev_mode = None
+        for seg in self.plan:
+            rng = random.Random(f"{seed}-{seg['file']}-{seg['shot']}")
+            if seg["file"] not in per_image:   # one shuffled focal order + mode offset per image
+                r = random.Random(f"{seed}-{seg['file']}")
+                foci = FOCI[:]
+                r.shuffle(foci)
+                per_image[seg["file"]] = (foci, r.randrange(len(MODES)))
+            foci, off = per_image[seg["file"]]
+            mode = MODES[(off + seg["shot"]) % len(MODES)]
+            if mode == prev_mode:
+                mode = MODES[(off + seg["shot"] + 1) % len(MODES)]
+            prev_mode = mode
+            self.motion.append(_motion(mode, foci[seg["shot"] % len(foci)], rng))
         self.vignette = build_vignette()
         self.black = Image.new("RGB", (W, H), (0, 0, 0))
-        self._cache: Dict[int, Image.Image] = {}
+        self._cache: Dict[str, Image.Image] = {}
         self._lock = threading.Lock()
 
-    # -- source images (small LRU: only neighbouring segments are ever needed)
+    # -- source images (small cache: only neighbouring shots are ever needed)
     def _src(self, j: int) -> Image.Image:
+        key = self.plan[j]["path"]
         with self._lock:
-            img = self._cache.get(j)
+            img = self._cache.get(key)
             if img is None:
-                img = Image.open(self.plan[j]["path"]).convert("RGB")
+                img = Image.open(key).convert("RGB")
                 if img.size != (W, H):
                     img = img.resize((W, H), Image.LANCZOS)
+                img = img.filter(ImageFilter.UnsharpMask(radius=1.4, percent=60, threshold=2))  # crops stay crisp
                 img.load()
-                self._cache[j] = img
+                self._cache[key] = img
             return img
 
     def trim_cache(self, t: float) -> None:
         i = max(0, bisect.bisect_right(self.starts, t) - 1)
+        keep = {self.plan[k]["path"] for k in range(max(0, i - 1), min(self.n, i + 3))}
         with self._lock:
-            for k in [k for k in self._cache if k < i - 1 or k > i + 2]:
+            for k in [k for k in self._cache if k not in keep]:
                 del self._cache[k]
 
     def _view(self, j: int, t: float) -> Image.Image:
         life0 = 0.0 if j == 0 else self.starts[j] - X / 2
         life1 = self.total if j == self.n - 1 else self.starts[j + 1] + X / 2
         p = min(1.0, max(0.0, (t - life0) / max(1e-6, life1 - life0)))
+        p = 0.5 * p + 0.5 * _smooth(p)          # gentle ease, still moving through the crossfades
         m = self.motion[j]
         z = m["z0"] + (m["z1"] - m["z0"]) * p
         half = 0.5 / z
@@ -138,9 +182,7 @@ class Renderer:
         img = ImageChops.multiply(img, self.vignette)
 
         # sleep-friendly: gently darken the picture over the final 40% of the video
-        dim = 1.0 - 0.40 * _smooth((t - 0.6 * self.total) / (0.4 * self.total))
-
-        fade = dim
+        fade = 1.0 - 0.40 * _smooth((t - 0.6 * self.total) / (0.4 * self.total))
         if t < 1.5:
             fade = min(fade, _smooth(t / 1.5))
         if t > self.total - END_FADE_SECONDS:
@@ -156,6 +198,7 @@ def render_video(plan: List[Dict], timeline: Dict, script: Dict, audio_path: Pat
     total = timeline["total_duration"]
     nframes = int(round(total * FPS))
     renderer = Renderer(plan, timeline, script, seed)
+    log(f"{len(plan)} images -> {renderer.n} shots (avg {total / renderer.n:.1f}s each)")
     tmp_out = workdir / "video_rendering.mp4"
     ffmpeg_log = workdir / "ffmpeg.log"
 
@@ -195,7 +238,6 @@ def render_video(plan: List[Dict], timeline: Dict, script: Dict, audio_path: Pat
 # --------------------------------------------------------------------------- thumbnail
 def make_thumbnail(plan: List[Dict], title: str, out_path: Path) -> Path:
     """1280x720 JPG: first scene image, brightened, with a big readable title (thumbnails may carry text; the video never does)."""
-    from PIL import ImageEnhance, ImageFilter
     img = Image.open(plan[0]["path"]).convert("RGB").resize((1280, 720), Image.LANCZOS)
     img = ImageEnhance.Contrast(ImageEnhance.Color(img).enhance(1.25)).enhance(1.12)
     shade = Image.new("L", (1280, 720), 0)
@@ -211,7 +253,8 @@ def make_thumbnail(plan: List[Dict], title: str, out_path: Path) -> Path:
         for w in words:
             t = f"{cur} {w}".strip()
             if d.textlength(t, font=font) > 700 and cur:
-                lines.append(cur); cur = w
+                lines.append(cur)
+                cur = w
             else:
                 cur = t
         lines.append(cur)

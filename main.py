@@ -53,6 +53,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--speed", type=float, default=config.KOKORO_SPEED, help="Kokoro speaking speed (default 0.92)")
     p.add_argument("--fire-db", type=float, default=config.FIRE_IDLE_DB,
                    help="Fireplace level in dB below the voice when it is silent (default 20; 24 while speaking)")
+    p.add_argument("--image-interval", type=float, default=config.SECONDS_PER_IMAGE,
+                   help="Seconds of video per newly generated AI image (default 24). Each image is cut into 4-8 s shots. "
+                        "Lower = more unique images but much slower generation.")
     p.add_argument("--seed", type=int, default=1234, help="Base seed for image generation")
     p.add_argument("--keep-cache", action="store_true", help="Keep .build_cache/ after a successful run")
     p.add_argument("--fresh", action="store_true", help="Do not resume an unfinished project; start a new one")
@@ -238,7 +241,7 @@ def smoke_test(cfg: Settings) -> int:
     timeline = tts_gen.build_timeline(titles, durs, [len(t.split()) for t in texts], min_total=0)
     script = {"chapters": [{"title": t} for t in titles]}
 
-    plan = image_gen.build_image_plan(timeline, seconds_per_image=6.0)
+    plan = image_gen.build_image_plan(timeline, seconds_per_image=14.0)
     (work / "images").mkdir()
     for k, seg in enumerate(plan):
         yy, xx = np.mgrid[0:1080, 0:1920]
@@ -264,7 +267,7 @@ def main(argv=None) -> int:
     a = parse_args(argv)
     cfg = Settings(topic=a.topic, duration_min=a.duration, output_dir=Path(a.output_dir), llm_model=a.llm,
                    image_model=a.image_model, voice=a.voice, speed=a.speed, seed=a.seed, keep_cache=a.keep_cache,
-                   fresh=a.fresh, fire_db=a.fire_db)
+                   fresh=a.fresh, fire_db=a.fire_db, image_interval=a.image_interval)
     try:
         return smoke_test(cfg) if a.smoke_test else run(cfg)
     except KeyboardInterrupt:
