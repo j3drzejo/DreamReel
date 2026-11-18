@@ -6,10 +6,6 @@ Turn a topic into a calm, long-form history or sleep documentary: a local langua
 
 > **Models run locally, but are downloaded first.** The first full run fetches several gigabytes of model weights from Hugging Face. Check each model's terms before publishing or monetizing generated videos.
 
-**Suggested GitHub repository name:** `dreamreel-local-ai-video-generator`  
-**Suggested description:** `Generate faceless sleep and history videos locally with AI — scripts, narration, images, thumbnails, and FFmpeg rendering.`  
-**Suggested topics:** `ai-video`, `local-ai`, `text-to-video`, `faceless-youtube`, `python`, `kokoro-tts`, `diffusers`
-
 ## What it makes
 
 - 10+ minute, 1080p (1920×1080), 24 fps H.264/AAC videos
