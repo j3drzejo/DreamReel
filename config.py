@@ -36,7 +36,8 @@ AUDIO_BITRATE = "192k"
 AUDIO_SR = 44100
 CROSSFADE_SECONDS = 1.0
 VIGNETTE_STRENGTH = 0.55
-SECONDS_PER_IMAGE = 24.0          # one new AI image about every 24 s (generation is the slow part)
+SECONDS_PER_IMAGE = 5.5           # a NEW AI image for every ~6 s of narration, generated from the words being spoken
+SPEECH_WPS = 2.3                  # narrated words per second (Kokoro at speed 0.92), used to size image passages
 SHOT_MIN_SECONDS = 4.0            # each image is cut into shots of 4-8 s with different framing/camera moves
 SHOT_MAX_SECONDS = 8.0
 END_FADE_SECONDS = 4.0            # fade to black at the very end
@@ -64,6 +65,8 @@ FIRE_ACTIVE_EXTRA_DB = 4.0        # ...and this much further down while the narr
 # --------------------------------------------------------------------------- models
 LLM_LARGE = "Qwen/Qwen2.5-7B-Instruct"
 LLM_SMALL = "Qwen/Qwen3-4B-Instruct-2507"   # Apache-2.0, fits comfortably in 8-10 GB
+LLM_XL = "Qwen/Qwen2.5-14B-Instruct"        # needs ~30 GB of GPU memory in bf16
+DIA_MODEL = "nari-labs/Dia-1.6B-0626"
 IMAGE_TIERS = [
     "Tongyi-MAI/Z-Image-Turbo",
     "black-forest-labs/FLUX.2-klein-4B",
@@ -87,6 +90,13 @@ class Settings:
     fresh: bool = False
     fire_db: float = FIRE_IDLE_DB
     image_interval: float = SECONDS_PER_IMAGE
+    notes: Optional[str] = None
+    tts: str = "auto"                 # auto | dia | kokoro
+    dia_model: str = DIA_MODEL
+    recast_voice: bool = False
+    device: str = "auto"              # auto | cuda | mps | cpu
+    encoder: str = "auto"             # auto | nvenc | x264
+    image_size: Optional[str] = None  # e.g. 1920x1080 (default: model's native 16:9 size)
 
     @property
     def target_words(self) -> int:
@@ -134,17 +144,66 @@ def fmt_timestamp(seconds: float) -> str:
 
 
 # --------------------------------------------------------------------------- hardware
-def get_device() -> str:
+_DEVICE_OVERRIDE = "auto"
+
+
+def set_device_override(dev: str) -> None:
+    global _DEVICE_OVERRIDE
+    _DEVICE_OVERRIDE = dev or "auto"
+
+
+def _available_devices() -> list:
+    devs = ["cpu"]
     try:
         import torch
 
         if torch.cuda.is_available():
-            return "cuda"
+            devs.append("cuda")
         if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-            return "mps"
+            devs.append("mps")
     except Exception:
         pass
-    return "cpu"
+    return devs
+
+
+def get_device() -> str:
+    """Best compute device (cuda > mps > cpu), unless the user forced one with --device."""
+    avail = _available_devices()
+    if _DEVICE_OVERRIDE != "auto":
+        if _DEVICE_OVERRIDE in avail:
+            return _DEVICE_OVERRIDE
+        return "cpu"
+    return "cuda" if "cuda" in avail else "mps" if "mps" in avail else "cpu"
+
+
+def gpu_setup() -> None:
+    """Enable the fast GPU math paths (TF32 etc.) when a CUDA GPU is in use."""
+    if get_device() != "cuda":
+        return
+    try:
+        import torch
+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+
+def hardware_summary() -> str:
+    dev = get_device()
+    try:
+        import torch
+
+        if dev == "cuda":
+            p = torch.cuda.get_device_properties(0)
+            return f"GPU: {p.name}, {p.total_memory / 1e9:.0f} GB VRAM (CUDA) | RAM {total_ram_gb():.0f} GB"
+    except Exception:
+        pass
+    if dev == "mps":
+        return f"Apple GPU (MPS), {total_ram_gb():.0f} GB unified memory"
+    return f"CPU only, {total_ram_gb():.0f} GB RAM (no usable GPU: models will be slow)"
 
 
 def total_ram_gb() -> float:
@@ -189,7 +248,10 @@ def usable_memory_gb(device: str) -> float:
 def pick_llm(cfg: Settings, device: str) -> str:
     if cfg.llm_model != "auto":
         return cfg.llm_model
-    return LLM_LARGE if usable_memory_gb(device) >= 16.5 else LLM_SMALL
+    mem = usable_memory_gb(device)
+    if device == "cuda" and mem >= 34:
+        return LLM_XL
+    return LLM_LARGE if mem >= 16.5 else LLM_SMALL
 
 
 def free_memory() -> None:

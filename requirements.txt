@@ -3,7 +3,7 @@
 #   pip install -r requirements.txt
 
 torch
-transformers>=4.51
+transformers>=4.56   # includes Dia support
 diffusers>=0.36
 accelerate>=0.34
 huggingface_hub
@@ -14,3 +14,4 @@ pillow>=10.1
 numpy
 scipy
 imageio-ffmpeg   # bundled ffmpeg fallback if the system ffmpeg is missing
+# Optional alternative Dia loader: pip install git+https://github.com/nari-labs/dia.git

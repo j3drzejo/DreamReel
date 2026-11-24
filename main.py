@@ -49,13 +49,25 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--output-dir", default=".", help="Where the project folder is created (default: current directory)")
     p.add_argument("--llm", default="auto", help="Hugging Face LLM id (default: auto-select for your memory)")
     p.add_argument("--image-model", default="auto", help="Hugging Face diffusion model id (default: auto-select)")
-    p.add_argument("--voice", default=config.KOKORO_VOICE, help="Kokoro voice: am_michael, am_fenrir, bm_george ...")
+    p.add_argument("--tts", choices=["auto", "dia", "kokoro"], default="auto",
+                   help="Voice engine. auto = Dia-1.6B on a CUDA GPU with >=10 GB, otherwise Kokoro. dia forces Dia.")
+    p.add_argument("--dia-model", default=config.DIA_MODEL, help="Dia checkpoint (default nari-labs/Dia-1.6B-0626)")
+    p.add_argument("--recast-voice", action="store_true",
+                   help="Dia: pick a new narrator voice instead of reusing assets/voice/dia_voice.wav")
+    p.add_argument("--voice", default=config.KOKORO_VOICE, help="Kokoro voice (fallback engine): am_michael, am_fenrir, bm_george ...")
     p.add_argument("--speed", type=float, default=config.KOKORO_SPEED, help="Kokoro speaking speed (default 0.92)")
+    p.add_argument("--device", choices=["auto", "cuda", "mps", "cpu"], default="auto",
+                   help="Force the compute device for all models (default auto: cuda > mps > cpu)")
+    p.add_argument("--encoder", choices=["auto", "nvenc", "x264"], default="auto",
+                   help="Video encoder: auto uses NVENC on NVIDIA GPUs when ffmpeg supports it, else libx264 (CPU)")
+    p.add_argument("--image-size", help="Generate images at this size, e.g. 1920x1080 (default: the model's native 1280x720). "
+                                        "Bigger = sharper but slower")
     p.add_argument("--fire-db", type=float, default=config.FIRE_IDLE_DB,
                    help="Fireplace level in dB below the voice when it is silent (default 20; 24 while speaking)")
     p.add_argument("--image-interval", type=float, default=config.SECONDS_PER_IMAGE,
-                   help="Seconds of video per newly generated AI image (default 24). Each image is cut into 4-8 s shots. "
-                        "Lower = more unique images but much slower generation.")
+                   help="Seconds of narration per generated AI image (default 5.5): every image is generated from the passage being "
+                        "spoken. Higher = fewer images, faster. 4-8 is the sweet spot for engagement.")
+    p.add_argument("--notes", help="Text file with your own trusted sources/facts about the topic (highest priority for accuracy)")
     p.add_argument("--seed", type=int, default=1234, help="Base seed for image generation")
     p.add_argument("--keep-cache", action="store_true", help="Keep .build_cache/ after a successful run")
     p.add_argument("--fresh", action="store_true", help="Do not resume an unfinished project; start a new one")
@@ -74,6 +86,8 @@ def build_info(script: dict, timeline: dict, duration_s: float) -> str:
         if t.lower() not in seen:
             seen.add(t.lower())
             hashtags.append("#" + t)
+    if script.get("sources"):
+        lines += ["", "Sources:"] + [f"{x['title']} - {x['url']}" for x in script["sources"]]
     lines += ["", " ".join(hashtags[:15]), "", "Narration and visuals in this video are AI-generated. Please enable the 'altered or synthetic content' disclosure when uploading."]
     desc = "\n".join(lines).replace('"', "'")
     title = script["title"].replace('"', "'")
@@ -81,6 +95,18 @@ def build_info(script: dict, timeline: dict, duration_s: float) -> str:
     tags = ", ".join(script.get("tags", [])).replace('"', "'")
     return (f'title: "{title}"\ndescription: "{desc}"\nduration: "{fmt_duration(duration_s)}"\n'
             f'topic: "{topic}"\ntags: "{tags}"\n')
+
+
+def write_research_notes(path: Path, script: dict) -> None:
+    """Human-readable fact sheet + sources so you can fact-check the video before publishing."""
+    sh = script.get("sheet") or {}
+    out = [f"# {script['title']}", "", f"Grounded in sources: {'yes' if script.get('grounded') else 'NO - model knowledge only, verify before publishing'}", ""]
+    out += [f"**Period:** {sh.get('period', '')}", f"**Region:** {sh.get('region', '')}", f"**Setting:** {sh.get('setting', '')}", ""]
+    for key, label in (("daily_life", "What people did"), ("clothing", "Clothing"), ("architecture_objects", "Buildings, objects, tools"),
+                       ("food_drink", "Food and drink"), ("uncertain", "Uncertain or debated"), ("anachronisms", "Excluded anachronisms")):
+        out += [f"## {label}"] + [f"- {x}" for x in sh.get(key, [])] + [""]
+    out += ["## Sources"] + [f"- {x['title']}: {x['url']}" for x in script.get("sources", [])]
+    path.write_text("\n".join(out), encoding="utf-8")
 
 
 def run(cfg: Settings) -> int:
@@ -98,7 +124,7 @@ def run(cfg: Settings) -> int:
         cfg.duration_min = 10.0
     roots = [Path.cwd(), Path.cwd() / "output", cfg.output_dir]
     t_start = time.time()
-    log(f"Device: {config.get_device()}")
+    log(f"Device: {config.get_device()} | {config.hardware_summary()}")
 
     project = Project()
     if not cfg.fresh:
@@ -130,7 +156,7 @@ def run(cfg: Settings) -> int:
     # ---- Stage 5: render
     video_tmp = cache / "video_final.mp4"
     if not video_tmp.exists():
-        video_editor.render_video(plan, timeline, script, master, video_tmp, cache, seed=cfg.seed)
+        video_editor.render_video(plan, timeline, script, master, video_tmp, cache, seed=cfg.seed, encoder=cfg.encoder)
     video_editor.make_thumbnail(plan, script["title"], project.folder / "thumbnail.jpg")
     final = project.folder / "video.mp4"
     shutil.move(str(video_tmp), str(final))
@@ -140,6 +166,7 @@ def run(cfg: Settings) -> int:
     if duration < 600:
         log(f"WARNING: rendered duration is {duration:.0f}s (< 10 min)")
     (project.folder / "info.txt").write_text(build_info(script, timeline, duration), encoding="utf-8")
+    write_research_notes(project.folder / "research.md", script)
     write_json(cache / "done.json", {"done": True})
     if not cfg.keep_cache:
         shutil.rmtree(cache, ignore_errors=True)
@@ -159,16 +186,17 @@ def _smoke_voice(texts, sr, cfg, work):
     try:
         import tts_gen
 
-        k = tts_gen._Kokoro(cfg.voice)
+        backend = tts_gen.open_backend(cfg)
         try:
-            out = [tts_gen._synth_chapter(k, t, cfg.speed) for t in texts]
+            out = [tts_gen._synth_chapter(backend, t)[0] for t in texts]
+            sr_used = backend.sr
         finally:
-            k.close()
+            backend.close()
             config.free_memory()
-        log(f"Smoke test voice: Kokoro ({cfg.voice})")
-        return out
+        log(f"Smoke test voice: {backend.name}")
+        return out, sr_used
     except Exception as exc:
-        log(f"Kokoro unavailable for smoke test ({type(exc).__name__}: {exc})")
+        log(f"Speech engine unavailable for smoke test ({type(exc).__name__}: {exc})")
 
     def _load_resampled(path):
         x, fs = sf.read(str(path), dtype="float32")
@@ -191,7 +219,7 @@ def _smoke_voice(texts, sr, cfg, work):
                     p = wav
                 out.append(_load_resampled(p))
             log(f"Smoke test voice: {tool} (robotic fallback - install Kokoro for the real narrator voice)")
-            return out
+            return out, sr
         except Exception:
             continue
     log("WARNING: no speech engine found - using synthetic noise as a stand-in voice. Mix levels are still tested, "
@@ -203,7 +231,7 @@ def _smoke_voice(texts, sr, cfg, work):
         t = np.arange(n) / sr
         env = np.clip(np.sin(2 * np.pi * 3.2 * t) * np.sin(2 * np.pi * 0.7 * t + i), 0, 1)
         out.append((rng.standard_normal(n) * env * 0.2).astype(np.float32))
-    return out
+    return out, sr
 
 
 def smoke_test(cfg: Settings) -> int:
@@ -230,7 +258,7 @@ def smoke_test(cfg: Settings) -> int:
         "By the hearth, the fire crackles and glows. Warm shadows move slowly along the walls.\n\n"
         "Rest now. Everything is calm, and everything is safe.",
     ]
-    chapters_audio = _smoke_voice(texts, sr, cfg, work)
+    chapters_audio, sr = _smoke_voice(texts, sr, cfg, work)
     durs = [len(x) / sr for x in chapters_audio]
     pieces = [np.zeros(int(config.LEAD_IN_SECONDS * sr), np.float32)]
     for i, x in enumerate(chapters_audio):
@@ -238,10 +266,15 @@ def smoke_test(cfg: Settings) -> int:
         if i < len(chapters_audio) - 1:
             pieces.append(np.zeros(int(config.CHAPTER_PAUSE * sr), np.float32))
     sf.write(work / "voiceover.wav", np.concatenate(pieces), sr, subtype="FLOAT")
-    timeline = tts_gen.build_timeline(titles, durs, [len(t.split()) for t in texts], min_total=0)
-    script = {"chapters": [{"title": t} for t in titles]}
+    timeline = tts_gen.build_timeline(titles, durs, [len(t.split()) for t in texts], min_total=0, sample_rate=sr)
+    import shots
+    script = {"chapters": []}
+    for t, tx in zip(titles, texts):
+        sents = shots.split_sentences(tx)
+        units = shots.make_units(sents, shots.target_words_for(cfg.image_interval))
+        script["chapters"].append({"title": t, "narration": tx, "sentences": sents, "units": units})
 
-    plan = image_gen.build_image_plan(timeline, seconds_per_image=14.0)
+    plan = shots.build_unit_plan(script, timeline)
     (work / "images").mkdir()
     for k, seg in enumerate(plan):
         yy, xx = np.mgrid[0:1080, 0:1920]
@@ -256,7 +289,7 @@ def smoke_test(cfg: Settings) -> int:
         img.save(seg["path"])
 
     master = audio_mixer.build_master(cfg, timeline, work)
-    out = video_editor.render_video(plan, timeline, script, master, work / "smoke.mp4", work, seed=1)
+    out = video_editor.render_video(plan, timeline, script, master, work / "smoke.mp4", work, seed=1, encoder=cfg.encoder)
     video_editor.make_thumbnail(plan, "A Night Inside a Medieval Monastery", work / "thumbnail.jpg")
     dur = config.probe_duration(out)
     log(f"SMOKE TEST OK: {out}  ({dur:.1f}s, expected {timeline['total_duration']:.1f}s)")
@@ -267,7 +300,11 @@ def main(argv=None) -> int:
     a = parse_args(argv)
     cfg = Settings(topic=a.topic, duration_min=a.duration, output_dir=Path(a.output_dir), llm_model=a.llm,
                    image_model=a.image_model, voice=a.voice, speed=a.speed, seed=a.seed, keep_cache=a.keep_cache,
-                   fresh=a.fresh, fire_db=a.fire_db, image_interval=a.image_interval)
+                   fresh=a.fresh, fire_db=a.fire_db, image_interval=a.image_interval, notes=a.notes,
+                   tts=a.tts, dia_model=a.dia_model, recast_voice=a.recast_voice, device=a.device, encoder=a.encoder,
+                   image_size=a.image_size)
+    config.set_device_override(a.device)
+    config.gpu_setup()
     try:
         return smoke_test(cfg) if a.smoke_test else run(cfg)
     except KeyboardInterrupt:

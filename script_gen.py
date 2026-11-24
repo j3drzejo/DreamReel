@@ -13,11 +13,16 @@ from typing import Dict, List, Optional
 
 import config
 from config import free_memory, log, read_json, write_json
+import research
 from scanner import DUPLICATE_THRESHOLD, covered_strings, similarity
 
 SYSTEM_OUTLINE = (
     "You are an award-winning documentary writer who creates calm, immersive, historically grounded "
     "bedtime documentaries for YouTube sleep channels. You answer with a single valid JSON object and nothing else."
+)
+SYSTEM_HISTORIAN = (
+    "You are a meticulous historian. You rely on the supplied source excerpts and on well-established scholarship, "
+    "you never invent specifics, and you answer with a single valid JSON object and nothing else."
 )
 SYSTEM_NARRATOR = (
     "You are a gentle, soothing narrator-writer of bedtime history documentaries. You write in the second "
@@ -136,26 +141,28 @@ def _validate_outline(d: dict, topic_hint: Optional[str]) -> dict:
     for i, ch in enumerate(chapters, 1):
         if not isinstance(ch, dict):
             raise ValueError("chapter is not an object")
-        ct, ip = _clean_line(ch.get("title", "")), _clean_line(ch.get("image_prompt", ""))
-        if not ct or not ip:
-            raise ValueError(f"chapter {i} missing title/image_prompt")
-        subs = [_clean_line(s) for s in ch.get("sub_scenes", []) if isinstance(s, str) and s.strip()][:4]
-        out.append({"title": ct, "summary": _clean_line(ch.get("summary", "")), "image_prompt": ip, "sub_scenes": subs})
+        ct = _clean_line(ch.get("title", ""))
+        scene = _clean_line(ch.get("scene", "") or ch.get("image_prompt", ""))
+        if not ct or not scene:
+            raise ValueError(f"chapter {i} missing title/scene")
+        subs = [_clean_line(x) for x in ch.get("sub_scenes", []) if isinstance(x, str) and x.strip()][:4]
+        out.append({"title": ct, "summary": _clean_line(ch.get("summary", "")),
+                    "activity": _clean_line(ch.get("activity", "")) or _clean_line(ch.get("summary", "")),
+                    "scene": scene, "sub_scenes": subs})
     tags = [re.sub(r"[^A-Za-z0-9 ]", "", t).strip() for t in d.get("tags", []) if isinstance(t, str)]
     tags = [t for t in tags if t][:15]
     desc = str(d.get("description", "")).strip() or f"Drift off to sleep as we travel back in time: {title}."
     return {
-        "topic": _clean_line(d.get("topic") or topic_hint or title),
+        "topic": _clean_line(topic_hint or d.get("topic") or title),
         "title": title,
         "description": desc,
         "tags": tags,
         "chapters": out,
     }
 
-
 def _fallback_outline(topic: str) -> dict:
     """Used only if the LLM fails to produce valid JSON several times in a row."""
-    shots = ["wide establishing view", "close detail of everyday objects", "people quietly at work", "a doorway at dusk"]
+    shots = ["wide view of the whole scene", "close detail of everyday objects", "people quietly at work", "a doorway at dusk"]
     stages = [
         ("Settling In", "arriving and getting your bearings"),
         ("First Light", "the quiet hour before dawn and the start of the day"),
@@ -168,12 +175,8 @@ def _fallback_outline(topic: str) -> dict:
         ("Stories by the Fire", "songs, stories and shared memory"),
         ("The Long Night", "candles are snuffed and sleep settles in"),
     ]
-    chapters = []
-    for t, s in stages:
-        base = f"Cinematic oil painting, {topic}, {s}, warm candlelight, historically accurate, highly detailed, 16:9"
-        chapters.append(
-            {"title": t, "summary": f"{s} ({topic})", "image_prompt": base, "sub_scenes": [f"{base}, {x}" for x in shots[:3]]}
-        )
+    chapters = [{"title": t, "summary": f"{x} ({topic})", "activity": x, "scene": f"{x}, warm firelight",
+                 "sub_scenes": [f"{x}, {sh}" for sh in shots[:3]]} for t, x in stages]
     return {
         "topic": topic,
         "title": topic,
@@ -182,70 +185,163 @@ def _fallback_outline(topic: str) -> dict:
         "chapters": chapters,
     }
 
+# --------------------------------------------------------------------------- topic + research
+def _pick_topic(llm: LLM, cfg: config.Settings, existing, seeds: List[str]) -> str:
+    covered = covered_strings(existing)
+    seed_txt = "\n".join(f"- {x}" for x in seeds) if seeds else "(none)"
+    avoid = "\n".join(f"- {c}" for c in covered[:60]) or "(none)"
+    extra = ""
+    for attempt in range(3):
+        prompt = f"""Choose ONE specific, well-documented historical setting for a calm bedtime documentary about what ordinary life was really like.
+Pick one of these seed ideas, or a closely related one (a precise place and period, a real, well-documented society):
+{seed_txt}
+Never repeat or closely resemble anything already covered:
+{avoid}
+{extra}
+Return ONLY JSON: {{"topic": "specific scenario in one short phrase, max 12 words"}}"""
+        try:
+            topic = _clean_line(extract_json(llm.chat(SYSTEM_OUTLINE, prompt, max_new_tokens=120, temperature=0.8))["topic"])
+        except Exception:
+            continue
+        if len(topic) < 8:
+            continue
+        if max((similarity(topic, c) for c in covered), default=0.0) < DUPLICATE_THRESHOLD:
+            return topic
+        extra = f'"{topic}" is too similar to an existing video. Choose a clearly different setting.'
+    return seeds[0] if seeds else "What Life Was Really Like in the Middle Ages"
+
+
+def _fact_sheet(llm: LLM, topic: str, source_text: str, notes: str) -> dict:
+    src = ""
+    if notes:
+        src += f"USER NOTES (highest priority, always trust over everything else):\n{notes[:5000]}\n\n"
+    src += source_text[:11000] if source_text else "(no source excerpts available: rely only on well-established scholarship and list anything uncertain)"
+    prompt = f"""Topic: "{topic}"
+
+SOURCE EXCERPTS (prefer these over your memory):
+{src}
+
+Build a historical FACT SHEET for writing an accurate documentary and drawing accurate pictures of this exact time and place.
+Return ONLY a JSON object with exactly these keys:
+{{
+  "period": "specific dates, e.g. 'c. 793-1066 CE (Viking Age)'",
+  "region": "country/region and kind of community",
+  "visual_anchor": "max 8 words naming the period and place for image prompts, e.g. 'Viking Age Scandinavia, tenth century'",
+  "setting": "one sentence: the place and who lives there",
+  "daily_life": ["10 to 12 short statements of what ordinary people of this period actually did: work, chores, meals, rituals, leisure, by time of day and season"],
+  "clothing": ["4 to 6 short items: typical dress, fabrics, footwear, jewelry"],
+  "architecture_objects": ["6 to 8 short items: buildings, furniture, tools, containers, light sources and materials typical of the period"],
+  "food_drink": ["5 to 7 foods and drinks actually available in this period and region"],
+  "sensory": ["4 to 6 sounds, smells and textures true to the setting"],
+  "anachronisms": ["12 to 18 things that did NOT exist or were NOT in use here and then, each 1 to 2 words, singular, such as 'clock', 'potato', 'glass window', 'fork'"],
+  "uncertain": ["2 to 4 points that are debated or poorly documented"]
+}}
+Use only facts supported by the excerpts or universally established. Do not invent names, dates or numbers."""
+    for _ in range(3):
+        try:
+            return research.normalize_sheet(extract_json(llm.chat(SYSTEM_HISTORIAN, prompt, max_new_tokens=1500, temperature=0.3)), topic)
+        except Exception as exc:
+            log(f"Fact sheet attempt unusable ({exc}); retrying")
+    return research.normalize_sheet({}, topic)
+
+
+def _research(llm: LLM, cfg: config.Settings, topic: str) -> dict:
+    log(f"Researching: {topic}")
+    queries: List[str] = []
+    try:
+        q = extract_json(llm.chat(SYSTEM_HISTORIAN,
+            f'List 4 English Wikipedia article titles that best cover the everyday life, buildings, clothing and food of: "{topic}". '
+            'Return ONLY JSON: {"articles": ["Title 1", "Title 2", "Title 3", "Title 4"]}', max_new_tokens=150, temperature=0.2))
+        queries = [str(x) for x in q.get("articles", []) if str(x).strip()][:4]
+    except Exception:
+        pass
+    queries = queries + [topic]
+    text, sources = "", []
+    try:
+        text, sources = research.gather(queries)
+        log(f"  read {len(sources)} Wikipedia articles: " + ", ".join(x["title"] for x in sources))
+    except Exception as exc:
+        log(f"  WARNING: could not reach Wikipedia ({type(exc).__name__}). Continuing from the model's own knowledge; "
+            "facts will be less reliable. Use --notes FILE to supply your own sources.")
+    notes = ""
+    if getattr(cfg, "notes", None):
+        try:
+            notes = open(cfg.notes, encoding="utf-8", errors="ignore").read()
+            log(f"  using your notes from {cfg.notes} ({len(notes.split())} words)")
+        except OSError as exc:
+            log(f"  could not read --notes file: {exc}")
+    sheet = _fact_sheet(llm, topic, text, notes)
+    log(f"  fact sheet: {sheet['period'] or 'period n/a'} | {len(sheet['daily_life'])} daily-life facts, "
+        f"{len(sheet['anachronisms'])} banned anachronisms")
+    return {"sheet": sheet, "sources": sources, "grounded": bool(text or notes)}
+
 
 # --------------------------------------------------------------------------- outline
-def _outline_prompt(topic: Optional[str], seeds: List[str], covered: List[str], n: int, extra: str) -> str:
-    if topic:
-        subject = f'TOPIC (use exactly this subject): "{topic}"'
-    elif seeds:
-        subject = (
-            "TOPIC: choose ONE of these seed ideas (or invent a closely related new one in the same spirit):\n"
-            + "\n".join(f"- {s}" for s in seeds)
-        )
-    else:
-        subject = "TOPIC: invent a fresh, specific historical 'what was life really like' scenario (any era or culture)."
-    avoid = ("ALREADY COVERED - never repeat or closely resemble any of these:\n" + "\n".join(f"- {c}" for c in covered[:60])) if covered else ""
+def _outline_prompt(topic: str, sheet: dict, n: int, extra: str, covered: List[str]) -> str:
+    avoid = ("ALREADY COVERED - never resemble:\n" + "\n".join(f"- {c}" for c in covered[:40])) if covered else ""
     return f"""Plan a long, calming bedtime history documentary narrated in second person.
-{subject}
+TOPIC (use exactly this subject): "{topic}"
 {avoid}
 {extra}
 
+HISTORICAL FACT SHEET (every chapter must be built from this; do not contradict it):
+{research.sheet_text(sheet)}
+
 Return ONLY a JSON object with exactly this shape:
 {{
-  "topic": "the specific scenario in one short phrase",
-  "title": "Engaging YouTube-style title, max 90 characters",
-  "description": "SEO-friendly YouTube description, 2 short paragraphs, mentions it is a relaxing sleep story with history facts. No timestamps.",
+  "title": "Engaging YouTube-style title that starts with the main keyword, max 90 characters",
+  "description": "SEO-friendly YouTube description, 2 short paragraphs, mentions it is a relaxing sleep story with real history. No timestamps.",
   "tags": ["10 to 14 short search tags"],
   "chapters": [
     {{
       "title": "short chapter title",
       "summary": "one sentence on what this chapter covers",
-      "image_prompt": "detailed, historically grounded visual prompt: cinematic oil painting style, specific scene, lighting, objects, 16:9 widescreen, highly detailed",
-      "sub_scenes": ["three different visual scenes from within this chapter, each a full image prompt"]
+      "activity": "what people of this period are doing in this chapter, taken from the fact sheet",
+      "scene": "ONE concrete picture, 18 to 25 words: who (period dress), doing what, where, with which period objects and light. Plain visual description only.",
+      "sub_scenes": ["four DIFFERENT concrete pictures from this chapter, 15 to 22 words each: vary place, activity, close-up of objects, wide view"]
     }}
   ]
 }}
 
 Rules: exactly {n} chapters that progress gently (arrival -> morning -> work -> food -> people -> beliefs -> hardships -> evening -> night -> sleep).
-Image prompts must be historically accurate, contain no text/writing, no modern objects, and no people's faces in extreme close-up."""
+Each chapter shows DIFFERENT activities drawn from the fact sheet's daily-life list. Scenes must only contain people, clothing, buildings, objects, food and tools that existed in this period and region.
+Scenes contain no text or writing, no modern objects, and nothing from the MUST NOT APPEAR list."""
 
-
-def _make_outline(llm: LLM, cfg: config.Settings, existing, seeds: List[str]) -> dict:
+def _make_outline(llm: LLM, cfg: config.Settings, existing, seeds: List[str], topic: str, res: dict) -> dict:
     covered = covered_strings(existing)
+    sheet = res["sheet"]
     extra = ""
     for attempt in range(1, 5):
-        prompt = _outline_prompt(cfg.topic, seeds, covered, config.NUM_CHAPTERS, extra)
-        raw = llm.chat(SYSTEM_OUTLINE, prompt, max_new_tokens=2800, temperature=0.8 if attempt < 3 else 0.5)
+        prompt = _outline_prompt(topic, sheet, config.NUM_CHAPTERS, extra, covered)
+        raw = llm.chat(SYSTEM_OUTLINE, prompt, max_new_tokens=3200, temperature=0.7 if attempt < 3 else 0.4)
         try:
-            data = _validate_outline(extract_json(raw), cfg.topic)
+            data = _validate_outline(extract_json(raw), topic)
         except Exception as exc:
             log(f"Outline attempt {attempt} unusable ({exc}); retrying")
             continue
-        clash = max((similarity(data["title"] + " " + data["topic"], c) for c in covered), default=0.0)
-        if clash >= DUPLICATE_THRESHOLD:
-            if cfg.topic:
-                log("Note: the requested topic resembles an existing video; continuing because you asked for it.")
-            elif attempt < 4:
-                log(f"Outline attempt {attempt} too similar to an existing video; asking for a different one")
-                extra = f'Your previous idea "{data["title"]}" was too similar to an existing video. Choose a clearly different subject.'
-                continue
-        return data
-    log("LLM never produced a valid outline; using the built-in generic outline.")
-    topic = cfg.topic or (seeds[0] if seeds else "What Life Was Really Like in the Middle Ages")
-    return _fallback_outline(topic)
-
+        break
+    else:
+        log("LLM never produced a valid outline; using the built-in generic outline.")
+        data = _fallback_outline(topic)
+    # build image prompts in code: period anchor + concrete scene + period details, with anachronisms scrubbed
+    for ch in data["chapters"]:
+        ch["image_prompt"] = research.compose_image_prompt(sheet, ch["scene"])
+        ch["sub_scenes"] = [research.compose_image_prompt(sheet, x) for x in ch["sub_scenes"]]
+    data["sheet"], data["sources"], data["grounded"] = sheet, res["sources"], res["grounded"]
+    return data
 
 # --------------------------------------------------------------------------- narration
+def _clean_for(outline: dict, text: str) -> str:
+    """Clean LLM output, then drop any sentence that mentions a banned (anachronistic) term."""
+    out = clean_narration(text)
+    terms = research.banned_terms(outline.get("sheet", {}))
+    flagged = research.find_anachronisms(out, terms)
+    if flagged:
+        log(f"  removed sentences with anachronisms: {', '.join(flagged)}")
+        out = research.drop_anachronisms(out, terms)
+    return out
+
+
 def _word_count(t: str) -> int:
     return len(t.split())
 
@@ -294,16 +390,19 @@ def _chapter_prompt(outline: dict, i: int, words: int, prev_tail: str) -> str:
 Full chapter plan:
 {plan}
 
+HISTORICAL FACT SHEET (what people really did and used; stay consistent with it):
+{research.sheet_text(outline.get('sheet', {}))}
+
 Write the narration for chapter {i + 1}: "{chs[i]['title']}" - {chs[i]['summary']}
+In this chapter people are shown: {chs[i].get('activity', '')}
 {_role(i, len(chs))}{prev}
 Requirements:
 - About {words} words (between {int(words * 0.9)} and {int(words * 1.15)}).
 - Second person, present tense ("You step through the doorway..."), calm, slow, deeply sensory: warm light, soft sounds, smells, textures, temperature.
 - 2 to 4 paragraphs separated by a blank line. Short and medium sentences. Gentle rhythm, no cliffhangers, nothing startling.
-- Weave in genuine, plausible historical detail about daily life; stay historically grounded and avoid inventing precise statistics. No graphic violence.
-- Write all numbers and years in words. No modern references.
+- ACCURACY: use only details consistent with the fact sheet. Never mention anything from the MUST NOT APPEAR list. Do not invent names, exact dates, numbers, statistics or quotations. For uncertain points use hedges such as "often", "most likely" or "historians believe". Teach one or two real facts about how people lived in this chapter.
+- No graphic violence. Write all numbers and years in words. No modern references, and no modern units such as minutes.
 - Output ONLY the narration text: no title, no headings, no lists, no markdown, no stage directions, no sound-effect notes."""
-
 
 def _extend_prompt(outline: dict, i: int, so_far: str, need: int) -> str:
     closing = "" if i < len(outline["chapters"]) - 1 else " You may end with a gentle goodnight."
@@ -311,18 +410,20 @@ def _extend_prompt(outline: dict, i: int, so_far: str, need: int) -> str:
 
 {so_far}
 
-Continue directly from where it stops with roughly {need} more words in exactly the same calm second-person present-tense voice.
-Add NEW sensory detail and historical texture; do not repeat anything already said. Do not conclude the chapter or say goodnight.{closing}
-Output ONLY the new continuation text, plain prose, paragraphs separated by a blank line."""
+Fact sheet to stay consistent with:
+{research.sheet_text(outline.get('sheet', {}))}
 
+Continue directly from where it stops with roughly {need} more words in exactly the same calm second-person present-tense voice.
+Add NEW sensory detail and real historical texture from the fact sheet; do not repeat anything already said, invent nothing, and never mention anything from the MUST NOT APPEAR list. Do not conclude the chapter or say goodnight.{closing}
+Output ONLY the new continuation text, plain prose, paragraphs separated by a blank line."""
 
 def _narrate_chapter(llm: LLM, outline: dict, i: int, words: int, prev_tail: str) -> str:
     raw = llm.chat(SYSTEM_NARRATOR, _chapter_prompt(outline, i, words, prev_tail), max_new_tokens=int(words * 2.0) + 150, temperature=0.7)
-    text = clean_narration(raw)
+    text = _clean_for(outline, raw)
     for _ in range(2):
         if _word_count(text) >= 0.75 * words:
             break
-        more = clean_narration(llm.chat(SYSTEM_NARRATOR, _extend_prompt(outline, i, text, words - _word_count(text)),
+        more = _clean_for(outline, llm.chat(SYSTEM_NARRATOR, _extend_prompt(outline, i, text, words - _word_count(text)),
                                         max_new_tokens=int(words * 1.4) + 100, temperature=0.7))
         more = _cap_words(more, int((words - _word_count(text)) * 1.25) + 10)
         text = (text + "\n\n" + more).strip()
@@ -373,24 +474,109 @@ def _write_narration(llm: LLM, cfg: config.Settings, outline: dict, cache) -> di
         order = sorted(range(n - 1), key=lambda k: _word_count(texts[k]))
         for k in order[:4]:
             need = max(60, per - _word_count(texts[k]) + 40)
-            more = clean_narration(llm.chat(SYSTEM_NARRATOR, _extend_prompt(outline, k, texts[k], need),
+            more = _clean_for(outline, llm.chat(SYSTEM_NARRATOR, _extend_prompt(outline, k, texts[k], need),
                                             max_new_tokens=int(need * 1.6) + 100))
             more = _cap_words(more, int(need * 1.25))
             if more:
                 texts[k] = texts[k] + "\n\n" + more
                 (parts / f"ch{k + 1:02d}.txt").write_text(texts[k], encoding="utf-8")
 
+    unit_data = _write_units(llm, cfg, outline, texts, cache)
     return {
         "topic": outline["topic"],
         "title": outline["title"],
         "description": outline["description"],
         "tags": outline["tags"],
+        "sheet": outline.get("sheet", {}),
+        "sources": outline.get("sources", []),
+        "grounded": outline.get("grounded", False),
         "chapters": [
-            {"title": c["title"], "narration": t, "image_prompt": c["image_prompt"], "sub_scenes": c["sub_scenes"]}
-            for c, t in zip(chs, texts)
+            {"title": c["title"], "narration": t, "image_prompt": c["image_prompt"], "sub_scenes": c["sub_scenes"],
+             "sentences": u["sentences"], "units": u["units"]}
+            for c, t, u in zip(chs, texts, unit_data)
         ],
         "word_count": sum(_word_count(t) for t in texts),
     }
+
+
+# --------------------------------------------------------------------------- per-passage image prompts
+SYSTEM_ILLUSTRATOR = (
+    "You are an art director for a historical documentary. You write precise, period-accurate image prompts and "
+    "answer with a single valid JSON object and nothing else."
+)
+VARIANTS = ["wide view of the whole scene", "medium shot of people at their task", "close-up of hands and tools",
+            "detail of food and vessels", "interior seen through a doorway", "view across the settlement at dusk"]
+
+
+def _unit_request(outline: dict, ci: int, passages: List[str], prev: str) -> str:
+    ch, sheet = outline["chapters"][ci], outline.get("sheet", {})
+    j = lambda k, n: "; ".join(sheet.get(k, [])[:n])
+    items = "\n".join(f"{k + 1}. {p}" for k, p in enumerate(passages))
+    prev_line = f"Previous image: {prev}\n" if prev else ""
+    return f"""Illustrating the documentary "{outline['title']}" ({sheet.get('period', '')}, {sheet.get('region', '')}).
+Chapter: "{ch['title']}" - {ch.get('activity', '')}
+Period-accurate details you may use. Clothing: {j('clothing', 4)}. Buildings, objects, tools, light: {j('architecture_objects', 6)}. Food: {j('food_drink', 4)}.
+NEVER show: {j('anachronisms', 14)}.
+{prev_line}
+Write ONE image prompt for each narration passage below. Each prompt must show exactly what its passage describes (place, people and what they are doing, objects, light) using only period-accurate clothing, buildings, tools and food. 16 to 22 words, plain visual description, nothing written in the picture, no modern objects, people seen from behind or at a distance. Consecutive prompts must look clearly different: vary wide view, medium view and close-up of objects, hands, food or tools.
+
+Passages:
+{items}
+
+Return ONLY JSON: {{"prompts": ["prompt for passage 1", "... exactly {len(passages)} items"]}}"""
+
+
+def _write_units(llm: LLM, cfg: config.Settings, outline: dict, texts: List[str], cache) -> List[dict]:
+    import shots
+
+    target = shots.target_words_for(cfg.image_interval)
+    sheet = outline.get("sheet", {})
+    res: List[dict] = []
+    total = 0
+    for ci, text in enumerate(texts):
+        f = cache / "script_parts" / f"units_{ci + 1:02d}.json"
+        sents = shots.split_sentences(text)
+        cached = None
+        if f.exists():
+            try:
+                cached = read_json(f)
+                if cached["target"] != target or cached["sentences"] != sents:
+                    cached = None
+            except Exception:
+                cached = None
+        if cached:
+            res.append({"sentences": sents, "units": cached["units"]})
+            total += len(cached["units"])
+            continue
+        units = shots.make_units(sents, target)
+        passages = [shots.unit_text(sents, u) for u in units]
+        scenes: List[str] = []
+        for b in range(0, len(passages), 6):
+            batch = passages[b:b + 6]
+            got: List[str] = []
+            for _ in range(2):
+                try:
+                    arr = extract_json(llm.chat(SYSTEM_ILLUSTRATOR, _unit_request(outline, ci, batch, scenes[-1] if scenes else ""),
+                                                max_new_tokens=130 * len(batch) + 100, temperature=0.6)).get("prompts", [])
+                    arr = [_clean_line(x) for x in arr if isinstance(x, str) and len(x.split()) >= 5]
+                    if len(arr) == len(batch):
+                        got = arr
+                        break
+                except Exception:
+                    pass
+            if not got:   # model failed twice: fall back to the chapter scene with a varied framing
+                base = outline["chapters"][ci]["scene"]
+                got = [f"{base}, {VARIANTS[(b + k) % len(VARIANTS)]}" for k in range(len(batch))]
+                log(f"  chapter {ci + 1}: fell back to generic scenes for passages {b + 1}-{b + len(batch)}")
+            scenes += got
+        for u, sc in zip(units, scenes):
+            u["prompt"] = research.compose_image_prompt(sheet, sc)
+        write_json(f, {"target": target, "sentences": sents, "units": units})
+        res.append({"sentences": sents, "units": units})
+        total += len(units)
+        log(f"Image prompts: chapter {ci + 1}/{len(texts)} -> {len(units)} images")
+    log(f"{total} narration-matched images planned (one about every {cfg.image_interval:.0f}s)")
+    return res
 
 
 # --------------------------------------------------------------------------- public entry
@@ -407,7 +593,8 @@ def generate_script(cfg: config.Settings, existing, seeds: List[str], project) -
             outline = read_json(project.cache / "outline.json")
             log(f"Resuming outline: {outline['title']}")
         if outline is None:
-            outline = _make_outline(llm, cfg, existing, seeds)
+            topic = cfg.topic or _pick_topic(llm, cfg, existing, seeds)
+            outline = _make_outline(llm, cfg, existing, seeds, topic, _research(llm, cfg, topic))
             project.create(cfg.output_dir, outline["title"], outline["topic"])
             write_json(project.cache / "outline.json", outline)
             log(f"Title: {outline['title']}")
