@@ -30,7 +30,8 @@ def split_sentences(narration: str, max_words: int = 19) -> List[Dict]:
                     else:
                         merged.append(c)
                 if len(merged) > 1 and len(merged[-1].split()) < 5:
-                    merged[-2] += " " + merged.pop()
+                    tail = merged.pop()
+                    merged[-1] += " " + tail
                 out += [{"text": c, "para": pi} for c in merged]
             else:
                 out.append({"text": s, "para": pi})
